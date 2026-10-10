@@ -395,22 +395,27 @@ function ChatPanel({ onOpenInbox }: { onOpenInbox: () => void }) {
 }
 
 function OwnerInbox({ onClose }: { onClose: () => void }) {
-  const { isSignedIn } = useAuth();
+  const { isLoaded, isSignedIn } = useAuth();
+  const hasOwnerSession = isLoaded && Boolean(isSignedIn);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [reply, setReply] = useState('');
   const [replyError, setReplyError] = useState('');
   const list = useListOwnerChatConversations({
-    query: { enabled: Boolean(isSignedIn), queryKey: getListOwnerChatConversationsQueryKey(), staleTime: 0, refetchOnMount: 'always' },
+    query: { enabled: hasOwnerSession, queryKey: getListOwnerChatConversationsQueryKey(), staleTime: 0, refetchOnMount: 'always' },
     request: { credentials: 'include' },
   });
   const detail = useGetOwnerChatConversation(selectedId ?? '', {
-    query: { enabled: Boolean(selectedId), queryKey: getGetOwnerChatConversationQueryKey(selectedId ?? '') },
+    query: { enabled: hasOwnerSession && Boolean(selectedId), queryKey: getGetOwnerChatConversationQueryKey(selectedId ?? '') },
     request: { credentials: 'include' },
   });
   const sendReply = useSendOwnerChatReply({ request: { credentials: 'include' } });
   const queryClient = useQueryClient();
   const selectedConversation = list.data?.conversations.find((conversation) => conversation.id === selectedId);
-  useChatStream('owner', selectedId ?? undefined, undefined, Boolean(isSignedIn) && !list.isError);
+  useChatStream('owner', selectedId ?? undefined, undefined, hasOwnerSession && !list.isError);
+
+  useEffect(() => {
+    if (isLoaded && !isSignedIn) setSelectedId(null);
+  }, [isLoaded, isSignedIn]);
 
   const submitReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -442,13 +447,14 @@ function OwnerInbox({ onClose }: { onClose: () => void }) {
       <div className="owner-inbox-content">
         <section className="conversation-list" aria-label="Private conversations">
           <div className="conversation-list-title"><span>THREADS</span><button type="button" onClick={() => void list.refetch()} aria-label="Refresh conversations"><RotateCw size={13} /></button></div>
-          {!isSignedIn && <div className="inbox-signin"><LockKeyhole size={19} /><strong>Owner access</strong><p>Sign in to check the private inbox. Access is verified securely by the server.</p><button type="button" onClick={() => { window.location.assign(`${basePath}/sign-in`); }}>SIGN IN</button></div>}
-          {isSignedIn && list.isError && <div className="chat-state"><p>Inbox access is unavailable for this account.</p><small>Owner access is allowlisted on the server.</small><button type="button" onClick={() => void list.refetch()}>TRY AGAIN</button></div>}
-          {isSignedIn && list.isLoading && <div className="chat-skeleton inbox-skeleton"><span /><span /><span /></div>}
-          {isSignedIn && !list.isLoading && !list.isError && (list.data?.conversations.length ?? 0) === 0 && (
+          {!isLoaded && <div className="chat-skeleton inbox-skeleton" role="status" aria-label="Checking sign-in"><span /><span /><span /></div>}
+          {isLoaded && !isSignedIn && <div className="inbox-signin"><LockKeyhole size={19} /><strong>Owner access</strong><p>Sign in to check the private inbox. Access is verified securely by the server.</p><button type="button" onClick={() => { window.location.assign(`${basePath}/sign-in`); }}>SIGN IN</button></div>}
+          {hasOwnerSession && list.isError && <div className="chat-state"><p>Inbox access is unavailable for this account.</p><small>Check the owner email allowlist and server connection.</small><button type="button" onClick={() => void list.refetch()}>TRY AGAIN</button></div>}
+          {hasOwnerSession && list.isLoading && <div className="chat-skeleton inbox-skeleton" role="status" aria-label="Loading private conversations"><span /><span /><span /></div>}
+          {hasOwnerSession && list.isSuccess && (list.data?.conversations.length ?? 0) === 0 && (
             <div className="inbox-empty">No private messages yet.</div>
           )}
-          {isSignedIn && list.data?.conversations.map((conversation) => (
+          {hasOwnerSession && list.isSuccess && list.data?.conversations.map((conversation) => (
             <button type="button" key={conversation.id} className={`conversation-item${selectedId === conversation.id ? ' selected' : ''}`} onClick={() => setSelectedId(conversation.id)}>
               <span className="conversation-avatar">{conversation.guestName.slice(0, 1).toUpperCase()}</span>
               <span className="conversation-copy"><strong>{conversation.guestName}</strong><small>{conversation.preview}</small></span>
@@ -457,7 +463,11 @@ function OwnerInbox({ onClose }: { onClose: () => void }) {
           ))}
         </section>
         <section className="owner-thread" aria-label="Conversation thread">
-          {!selectedId ? (
+          {!isLoaded ? (
+            <div className="thread-placeholder"><div className="chat-skeleton"><span /><span /></div></div>
+          ) : !isSignedIn ? (
+            <div className="thread-placeholder"><LockKeyhole size={21} /><p>Sign in to read private threads.</p></div>
+          ) : !selectedId ? (
             <div className="thread-placeholder"><MessageCircle size={21} /><p>Select a thread to read it.</p></div>
           ) : (
             <>
