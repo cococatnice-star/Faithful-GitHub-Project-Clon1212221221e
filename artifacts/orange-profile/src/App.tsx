@@ -1,6 +1,7 @@
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type FormEvent,
   type ReactNode,
   useCallback,
   useEffect,
@@ -8,6 +9,10 @@ import {
   useState,
 } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { useQueryClient } from '@tanstack/react-query';
+import { ClerkProvider, SignIn, SignUp, useAuth, useClerk } from '@clerk/react';
+import { publishableKeyFromHost } from '@clerk/react/internal';
+import { shadcn } from '@clerk/themes';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -19,6 +24,12 @@ import {
   ExternalLink,
   FastForward,
   GripHorizontal,
+  MessageCircle,
+  Send,
+  ArrowLeft,
+  LockKeyhole,
+  Radio,
+  RotateCw,
   Pause,
   Play,
   Rewind,
@@ -34,11 +45,155 @@ import {
   FaYoutube,
 } from 'react-icons/fa6';
 import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
+import {
+  getGetOwnerChatConversationQueryKey,
+  getGetVisitorChatConversationQueryKey,
+  getListOwnerChatConversationsQueryKey,
+  getListPublicChatMessagesQueryKey,
+  type ChatMessage,
+  useCreateChatMessage,
+  useGetOwnerChatConversation,
+  useGetVisitorChatConversation,
+  useListOwnerChatConversations,
+  useListPublicChatMessages,
+  useSendOwnerChatReply,
+} from '@workspace/api-client-react';
 
 const queryClient = new QueryClient();
 const PROFILE = {
   username: 'CocoX.wtf',
 };
+const basePath = import.meta.env.BASE_URL.replace(/\/$/, '');
+const clerkPubKey = publishableKeyFromHost(
+  window.location.hostname,
+  import.meta.env.VITE_CLERK_PUBLISHABLE_KEY,
+);
+const clerkProxyUrl = import.meta.env.VITE_CLERK_PROXY_URL;
+if (!clerkPubKey) throw new Error('Missing VITE_CLERK_PUBLISHABLE_KEY.');
+
+function makeRandomId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function storedValue(key: string, create: () => string) {
+  try {
+    const current = localStorage.getItem(key);
+    if (current) return current;
+    const value = create();
+    localStorage.setItem(key, value);
+    return value;
+  } catch {
+    return create();
+  }
+}
+
+function useVisitorIdentity() {
+  const [visitorName, setVisitorName] = useState(() => {
+    try { return localStorage.getItem('cocox.chat.name') ?? ''; } catch { return ''; }
+  });
+  const visitorToken = useRef(storedValue('cocox.chat.visitor-token', makeRandomId)).current;
+  const [conversationId, setConversationId] = useState<string | null>(() => {
+    try { return localStorage.getItem('cocox.chat.conversation-id'); } catch { return null; }
+  });
+  const saveName = (name: string) => {
+    setVisitorName(name);
+    try { localStorage.setItem('cocox.chat.name', name); } catch { /* storage is optional */ }
+  };
+  const saveConversationId = (id: string) => {
+    setConversationId(id);
+    try { localStorage.setItem('cocox.chat.conversation-id', id); } catch { /* storage is optional */ }
+  };
+  return { visitorName, saveName, visitorToken, conversationId, saveConversationId };
+}
+
+function addMessageOnce(messages: ChatMessage[] | undefined, incoming: ChatMessage) {
+  const current = messages ?? [];
+  return current.some((message) => message.id === incoming.id)
+    ? current
+    : [...current, incoming].sort((a, b) => a.id - b.id);
+}
+
+function useChatStream(scope: 'public' | 'visitor' | 'owner', conversationId?: string, visitorToken?: string, enabled = true) {
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    if (!enabled || (scope === 'visitor' && !conversationId)) return;
+    const controller = new AbortController();
+    let retryTimer: number | undefined;
+    let active = true;
+    const queryKey = scope === 'public'
+      ? getListPublicChatMessagesQueryKey()
+      : scope === 'visitor'
+        ? getGetVisitorChatConversationQueryKey(conversationId!)
+        : conversationId
+          ? getGetOwnerChatConversationQueryKey(conversationId)
+          : getListOwnerChatConversationsQueryKey();
+    const recover = async () => {
+      await queryClient.invalidateQueries({ queryKey });
+      if (scope === 'owner') await queryClient.invalidateQueries({ queryKey: getListOwnerChatConversationsQueryKey() });
+    };
+    const connect = async () => {
+      try {
+        const params = new URLSearchParams({ scope });
+        if (conversationId) params.set('conversationId', conversationId);
+        const response = await fetch(`/api/chat/stream?${params}`, {
+          credentials: 'include',
+          headers: visitorToken ? { 'X-Chat-Token': visitorToken } : undefined,
+          signal: controller.signal,
+        });
+        if (!response.ok || !response.body) throw new Error('Chat stream unavailable');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (active) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() ?? '';
+          for (const frame of frames) {
+            const eventName = frame.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
+            const data = frame.split('\n').find((line) => line.startsWith('data:'))?.slice(5).trim();
+            if (eventName !== 'message' || !data) continue;
+            try {
+              const message = JSON.parse(data) as ChatMessage;
+              if (scope === 'public' && message.channel === 'public') {
+                queryClient.setQueryData<{ messages: ChatMessage[] }>(queryKey, (old) => ({
+                  messages: addMessageOnce(old?.messages, message),
+                }));
+              } else if (scope === 'owner' && message.channel === 'private') {
+                if (conversationId && message.conversationId === conversationId) {
+                  queryClient.setQueryData<{ messages: ChatMessage[] }>(queryKey, (old) => old
+                    ? { ...old, messages: addMessageOnce(old.messages, message) }
+                    : old);
+                }
+                void queryClient.invalidateQueries({ queryKey: getListOwnerChatConversationsQueryKey() });
+              } else if (scope === 'visitor' && message.conversationId === conversationId) {
+                queryClient.setQueryData<{ messages: ChatMessage[] }>(queryKey, (old) => old
+                  ? { ...old, messages: addMessageOnce(old.messages, message) }
+                  : old);
+              }
+            } catch { /* ignore malformed event frames */ }
+          }
+        }
+        if (active) await recover();
+      } catch {
+        if (!active || controller.signal.aborted) return;
+        await recover();
+      } finally {
+        if (active) retryTimer = window.setTimeout(() => void connect(), 2200);
+      }
+    };
+    void connect();
+    return () => {
+      active = false;
+      controller.abort();
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, [conversationId, enabled, queryClient, scope, visitorToken]);
+}
 
 type MusicTrack = {
   id: string;
@@ -73,6 +228,267 @@ function formatTime(seconds: number) {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60).toString().padStart(2, '0');
   return `${mins}:${secs}`;
+}
+
+function ChatPanel({ onOpenInbox }: { onOpenInbox: () => void }) {
+  const [mode, setMode] = useState<'public' | 'private'>('public');
+  const [body, setBody] = useState('');
+  const [sendError, setSendError] = useState('');
+  const feedRef = useRef<HTMLDivElement>(null);
+  const identity = useVisitorIdentity();
+  const publicHistory = useListPublicChatMessages();
+  const privateHistory = useGetVisitorChatConversation(identity.conversationId ?? '', {
+    query: {
+      enabled: mode === 'private' && Boolean(identity.visitorName.trim()) && Boolean(identity.conversationId),
+      queryKey: getGetVisitorChatConversationQueryKey(identity.conversationId ?? ''),
+    },
+    request: { headers: { 'X-Chat-Token': identity.visitorToken }, credentials: 'include' },
+  });
+  const createMessage = useCreateChatMessage({ request: { credentials: 'include' } });
+  const queryClient = useQueryClient();
+  useChatStream('public');
+  useChatStream('visitor', identity.conversationId ?? undefined, identity.visitorToken, mode === 'private' && Boolean(identity.visitorName.trim()) && Boolean(identity.conversationId));
+
+  const messages = mode === 'public'
+    ? (publicHistory.data?.messages ?? []).filter((message) => message.channel === 'public')
+    : (privateHistory.data?.messages ?? []).filter((message) => message.channel === 'private');
+
+  useEffect(() => {
+    if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
+  }, [messages.length, mode]);
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const senderName = identity.visitorName.trim();
+    const messageBody = body.trim();
+    if (!senderName) {
+      setSendError('Add your name before sending a message.');
+      return;
+    }
+    if (!messageBody) return;
+    setSendError('');
+    createMessage.mutate({
+      data: {
+        channel: mode,
+        senderName,
+        body: messageBody,
+        visitorToken: identity.visitorToken,
+        ...(mode === 'private' ? { conversationId: identity.conversationId } : {}),
+      },
+    }, {
+      onSuccess: (message) => {
+        setBody('');
+        if (message.channel === 'public') {
+          queryClient.setQueryData<{ messages: ChatMessage[] }>(getListPublicChatMessagesQueryKey(), (old) => ({
+            messages: addMessageOnce(old?.messages, message),
+          }));
+        } else {
+          if (message.conversationId) {
+            identity.saveConversationId(message.conversationId);
+            queryClient.setQueryData<{ conversation: unknown; messages: ChatMessage[] }>(
+              getGetVisitorChatConversationQueryKey(message.conversationId),
+              (old) => old ? { ...old, messages: addMessageOnce(old.messages, message) } : old,
+            );
+          }
+        }
+      },
+      onError: () => setSendError('Message not sent. Check your connection and try again.'),
+    });
+  };
+
+  const loading = mode === 'public' ? publicHistory.isLoading : privateHistory.isLoading;
+  const failed = mode === 'public' ? publicHistory.isError : privateHistory.isError;
+  const retry = () => {
+    if (mode === 'public') void publicHistory.refetch();
+    else void privateHistory.refetch();
+  };
+
+  return (
+    <aside className="chat-panel" aria-label="Messages">
+      <header className="chat-head">
+        <div className="chat-brand-mark" aria-hidden="true"><MessageCircle size={17} /></div>
+        <div className="chat-heading">
+          <span className="chat-eyebrow">COCOX // LIVE</span>
+          <h2>Say something.</h2>
+        </div>
+        <span className="chat-live" aria-label="Chat available"><i /> OPEN</span>
+      </header>
+      <div className="chat-tabs" role="tablist" aria-label="Message channel">
+        <button type="button" role="tab" aria-selected={mode === 'public'} className={mode === 'public' ? 'is-active' : ''} onClick={() => { setMode('public'); setSendError(''); }}>
+          <Radio size={12} /> PUBLIC
+        </button>
+        <button type="button" role="tab" aria-selected={mode === 'private'} className={mode === 'private' ? 'is-active' : ''} onClick={() => { setMode('private'); setSendError(''); }}>
+          <LockKeyhole size={12} /> PRIVATE
+        </button>
+      </div>
+      {mode === 'private' && (
+        <div className="private-note">
+          <LockKeyhole size={13} aria-hidden="true" />
+          <span>A private note, just between you and CocoX.</span>
+          <button type="button" className="inbox-link" onClick={onOpenInbox} title="Owner inbox shortcut: Ctrl+Shift+/">
+            OWNER
+          </button>
+        </div>
+      )}
+      <div className="chat-log" ref={feedRef} aria-live="polite" aria-relevant="additions text">
+        {loading && (
+          <div className="chat-skeleton" aria-label="Loading messages">
+            <span /><span /><span />
+          </div>
+        )}
+        {failed && !loading && (
+          <div className="chat-state chat-error">
+            <p>Couldn’t load this conversation.</p>
+            <button type="button" onClick={retry}>TRY AGAIN</button>
+          </div>
+        )}
+        {!loading && !failed && messages.length === 0 && (
+          <div className="chat-empty">
+            <span className="empty-line" />
+            <p>{mode === 'public' ? 'No messages yet.' : 'Your private thread starts here.'}</p>
+            <small>{mode === 'public' ? 'Leave the first trace.' : 'Only you and CocoX can read this thread.'}</small>
+          </div>
+        )}
+        {messages.map((message) => (
+          <article className={`chat-message ${message.senderRole === 'owner' ? 'from-owner' : 'from-visitor'}`} key={message.id}>
+            <div className="message-meta">
+              <strong>{message.senderRole === 'owner' ? 'CocoX Owner' : message.senderName}</strong>
+              <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
+            </div>
+            <p>{message.body}</p>
+          </article>
+        ))}
+      </div>
+      <form className="chat-compose" onSubmit={submit}>
+        <label className="chat-field-label" htmlFor="chat-name">YOUR NAME</label>
+        <input
+          id="chat-name"
+          className="chat-name-input"
+          value={identity.visitorName}
+          maxLength={32}
+          required
+          placeholder="What should CocoX call you?"
+          onChange={(event) => identity.saveName(event.currentTarget.value)}
+        />
+        <label className="chat-field-label" htmlFor="chat-body">{mode === 'public' ? 'MESSAGE TO THE ROOM' : 'PRIVATE MESSAGE'}</label>
+        <div className="chat-message-entry">
+          <textarea
+            id="chat-body"
+            value={body}
+            maxLength={1200}
+            rows={2}
+            placeholder={mode === 'public' ? 'Leave a message…' : 'Write CocoX a private note…'}
+            onChange={(event) => setBody(event.currentTarget.value)}
+            required
+          />
+          <button type="submit" aria-label="Send message" disabled={createMessage.isPending || !identity.visitorName.trim() || !body.trim()}>
+            <Send size={15} />
+          </button>
+        </div>
+        <div className="chat-footer-row">
+          {sendError ? <span className="chat-form-error" role="alert">{sendError}</span> : <span>{mode === 'public' ? 'PUBLIC ROOM · NO ACCOUNT NEEDED' : 'PRIVATE · ONLY YOU AND OWNER'}</span>}
+          <span>{body.length}/1200</span>
+        </div>
+      </form>
+    </aside>
+  );
+}
+
+function OwnerInbox({ onClose }: { onClose: () => void }) {
+  const { isSignedIn } = useAuth();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [reply, setReply] = useState('');
+  const [replyError, setReplyError] = useState('');
+  const list = useListOwnerChatConversations({
+    query: { enabled: Boolean(isSignedIn), queryKey: getListOwnerChatConversationsQueryKey(), staleTime: 0, refetchOnMount: 'always' },
+    request: { credentials: 'include' },
+  });
+  const detail = useGetOwnerChatConversation(selectedId ?? '', {
+    query: { enabled: Boolean(selectedId), queryKey: getGetOwnerChatConversationQueryKey(selectedId ?? '') },
+    request: { credentials: 'include' },
+  });
+  const sendReply = useSendOwnerChatReply({ request: { credentials: 'include' } });
+  const queryClient = useQueryClient();
+  const selectedConversation = list.data?.conversations.find((conversation) => conversation.id === selectedId);
+  useChatStream('owner', selectedId ?? undefined, undefined, Boolean(isSignedIn) && !list.isError);
+
+  const submitReply = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedId || !reply.trim()) return;
+    setReplyError('');
+    sendReply.mutate({ conversationId: selectedId, data: { body: reply.trim() } }, {
+      onSuccess: (message) => {
+        setReply('');
+        queryClient.setQueryData<{ conversation: unknown; messages: ChatMessage[] }>(
+          getGetOwnerChatConversationQueryKey(selectedId),
+          (old) => old ? { ...old, messages: addMessageOnce(old.messages, message) } : old,
+        );
+        void list.refetch();
+      },
+      onError: () => setReplyError('Reply failed. Try again.'),
+    });
+  };
+
+  return (
+    <aside className="chat-panel owner-inbox" aria-label="Owner inbox">
+      <header className="chat-head owner-head">
+        <div className="chat-brand-mark" aria-hidden="true"><LockKeyhole size={16} /></div>
+        <div className="chat-heading">
+          <span className="chat-eyebrow">PRIVATE // OWNER ONLY</span>
+          <h2>Inbox</h2>
+        </div>
+        <button type="button" className="chat-close" aria-label="Close inbox" onClick={onClose}><X size={17} /></button>
+      </header>
+      <div className="owner-inbox-content">
+        <section className="conversation-list" aria-label="Private conversations">
+          <div className="conversation-list-title"><span>THREADS</span><button type="button" onClick={() => void list.refetch()} aria-label="Refresh conversations"><RotateCw size={13} /></button></div>
+          {!isSignedIn && <div className="inbox-signin"><LockKeyhole size={19} /><strong>Owner access</strong><p>Sign in to check the private inbox. Access is verified securely by the server.</p><button type="button" onClick={() => { window.location.assign(`${basePath}/sign-in`); }}>SIGN IN</button></div>}
+          {isSignedIn && list.isError && <div className="chat-state"><p>Inbox access is unavailable for this account.</p><small>Owner access is allowlisted on the server.</small><button type="button" onClick={() => void list.refetch()}>TRY AGAIN</button></div>}
+          {isSignedIn && list.isLoading && <div className="chat-skeleton inbox-skeleton"><span /><span /><span /></div>}
+          {isSignedIn && !list.isLoading && !list.isError && (list.data?.conversations.length ?? 0) === 0 && (
+            <div className="inbox-empty">No private messages yet.</div>
+          )}
+          {isSignedIn && list.data?.conversations.map((conversation) => (
+            <button type="button" key={conversation.id} className={`conversation-item${selectedId === conversation.id ? ' selected' : ''}`} onClick={() => setSelectedId(conversation.id)}>
+              <span className="conversation-avatar">{conversation.guestName.slice(0, 1).toUpperCase()}</span>
+              <span className="conversation-copy"><strong>{conversation.guestName}</strong><small>{conversation.preview}</small></span>
+              <time>{new Date(conversation.updatedAt).toLocaleDateString([], { month: 'short', day: 'numeric' })}</time>
+            </button>
+          ))}
+        </section>
+        <section className="owner-thread" aria-label="Conversation thread">
+          {!selectedId ? (
+            <div className="thread-placeholder"><MessageCircle size={21} /><p>Select a thread to read it.</p></div>
+          ) : (
+            <>
+              <div className="owner-thread-title">
+                <button type="button" className="back-to-threads" aria-label="Back to threads" onClick={() => setSelectedId(null)}><ArrowLeft size={15} /></button>
+                <span><strong>{selectedConversation?.guestName ?? detail.data?.conversation.guestName ?? 'Conversation'}</strong><small>PRIVATE THREAD</small></span>
+              </div>
+              <div className="owner-thread-messages">
+                {detail.isLoading && <div className="chat-skeleton"><span /><span /></div>}
+                {detail.isError && <div className="chat-state"><p>Couldn’t load this thread.</p><button type="button" onClick={() => void detail.refetch()}>TRY AGAIN</button></div>}
+                {detail.data?.messages.filter((message) => message.channel === 'private').map((message) => (
+                  <article className={`chat-message ${message.senderRole === 'owner' ? 'from-owner' : 'from-visitor'}`} key={message.id}>
+                    <div className="message-meta"><strong>{message.senderRole === 'owner' ? 'CocoX Owner' : message.senderName}</strong><time>{new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>
+                    <p>{message.body}</p>
+                  </article>
+                ))}
+              </div>
+              <form className="chat-compose owner-compose" onSubmit={submitReply}>
+                <label className="chat-field-label" htmlFor="owner-reply">REPLY AS COCOX OWNER</label>
+                <div className="chat-message-entry">
+                  <textarea id="owner-reply" rows={2} maxLength={1200} value={reply} placeholder="Write a private reply…" onChange={(event) => setReply(event.currentTarget.value)} required />
+                  <button type="submit" aria-label="Send owner reply" disabled={sendReply.isPending || !reply.trim()}><Send size={15} /></button>
+                </div>
+                {replyError && <span className="chat-form-error" role="alert">{replyError}</span>}
+              </form>
+            </>
+          )}
+        </section>
+      </div>
+    </aside>
+  );
 }
 
 function useDraggable() {
@@ -231,6 +647,7 @@ function CursorFollower() {
 }
 
 function Home() {
+  const [ownerInboxOpen, setOwnerInboxOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -254,6 +671,19 @@ function Home() {
   const musicDrag = useDraggable();
   const socialDrag = useDraggable();
   const aboutDrag = useDraggable();
+
+  useEffect(() => {
+    const onInboxShortcut = (event: KeyboardEvent) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLElement && (target.isContentEditable || target.matches('input, textarea, select'));
+      if (event.ctrlKey && event.shiftKey && !event.altKey && (event.code === 'Slash' || event.key === '?') && !isEditing) {
+        event.preventDefault();
+        setOwnerInboxOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onInboxShortcut);
+    return () => window.removeEventListener('keydown', onInboxShortcut);
+  }, []);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -889,6 +1319,12 @@ function Home() {
           {videoMessage && <p className="video-message" role="status">{videoMessage}</p>}
         </section>
       </div>
+      {ownerInboxOpen
+        ? <OwnerInbox onClose={() => setOwnerInboxOpen(false)} />
+        : <ChatPanel onOpenInbox={() => setOwnerInboxOpen(true)} />}
+      <button type="button" className="inbox-shortcut" onClick={() => setOwnerInboxOpen(true)} aria-label="Open owner inbox" title="Owner inbox · Ctrl+Shift+/">
+        <LockKeyhole size={12} /><span>OWNER INBOX</span><kbd>CTRL</kbd><b>+</b><kbd>SHIFT</kbd><b>+</b><kbd>/</kbd>
+      </button>
       <CursorFollower />
     </main>
   );
@@ -899,10 +1335,121 @@ function Router() {
     <RoutedErrorBoundary>
       <Switch>
         <Route path="/" component={Home} />
+        <Route path="/sign-in/*?" component={SignInPage} />
+        <Route path="/sign-up/*?" component={SignUpPage} />
         <Route component={NotFound} />
       </Switch>
     </RoutedErrorBoundary>
   );
+}
+
+const clerkAppearance = {
+  theme: shadcn,
+  cssLayerName: 'clerk',
+  options: {
+    logoPlacement: 'inside' as const,
+    logoLinkUrl: basePath || '/',
+    logoImageUrl: `${window.location.origin}${basePath}/logo.svg`,
+  },
+  variables: {
+    colorPrimary: '#ff790c',
+    colorForeground: '#f4f0eb',
+    colorMutedForeground: '#aaa39d',
+    colorDanger: '#ff745e',
+    colorBackground: '#11100f',
+    colorInput: '#181614',
+    colorInputForeground: '#f4f0eb',
+    colorNeutral: '#4c3424',
+    fontFamily: 'Manrope, sans-serif',
+    borderRadius: '0.8rem',
+  },
+  elements: {
+    rootBox: 'w-full max-w-full flex justify-center',
+    cardBox: 'bg-[#11100f] border border-[#57351e] rounded-2xl w-[440px] max-w-full overflow-hidden shadow-2xl',
+    card: '!shadow-none !border-0 !bg-transparent !rounded-none',
+    footer: '!shadow-none !border-0 !bg-transparent !rounded-none',
+    headerTitle: 'text-[#fff5eb] font-bold tracking-tight',
+    headerSubtitle: 'text-[#b7aaa0]',
+    socialButtonsBlockButtonText: 'text-[#f4f0eb] font-medium',
+    formFieldLabel: 'text-[#e1d4ca]',
+    footerActionLink: 'text-[#ff9a43] hover:text-[#ffb477]',
+    footerActionText: 'text-[#aaa39d]',
+    dividerText: 'text-[#aaa39d]',
+    identityPreviewEditButton: 'text-[#ff9a43]',
+    formFieldSuccessText: 'text-[#ffb477]',
+    alertText: 'text-[#ffd1c7]',
+    logoBox: 'mb-3',
+    logoImage: 'max-h-10',
+    socialButtonsBlockButton: 'border border-[#453124] bg-[#191512] hover:bg-[#24180f]',
+    formButtonPrimary: 'bg-[#ff790c] text-[#160b04] font-bold hover:bg-[#ff9a43]',
+    formFieldInput: 'border-[#4a3628] bg-[#181614] text-[#f4f0eb]',
+    footerAction: 'border-t border-[#33271f]',
+    dividerLine: 'bg-[#453124]',
+    alert: 'border-[#693b2b] bg-[#291714]',
+    otpCodeFieldInput: 'border-[#4a3628] bg-[#181614] text-[#f4f0eb]',
+    formFieldRow: 'mb-4',
+    main: 'gap-4',
+  },
+};
+
+function SignInPage() {
+  return (
+    <main className="auth-stage">
+      <div className="auth-orbit" aria-hidden="true" />
+      <div className="auth-intro"><img src={`${basePath}/logo.svg`} alt="" /><span>COCOX.WTF // PRIVATE ACCESS</span><h1>Back in the room.</h1><p>Sign in to check private messages. Public chat stays open to everyone.</p></div>
+      <SignIn routing="path" path={`${basePath}/sign-in`} signUpUrl={`${basePath}/sign-up`} />
+    </main>
+  );
+}
+
+function SignUpPage() {
+  return (
+    <main className="auth-stage">
+      <div className="auth-orbit" aria-hidden="true" />
+      <div className="auth-intro"><img src={`${basePath}/logo.svg`} alt="" /><span>COCOX.WTF // ACCOUNT</span><h1>Make yourself known.</h1><p>Create an account to continue to CocoX.wtf.</p></div>
+      <SignUp routing="path" path={`${basePath}/sign-up`} signInUrl={`${basePath}/sign-in`} />
+    </main>
+  );
+}
+
+function ClerkRoutes() {
+  const [, setLocation] = useLocation();
+  const stripBase = (path: string) => basePath && path.startsWith(basePath)
+    ? path.slice(basePath.length) || '/'
+    : path;
+  return (
+    <ClerkProvider
+      publishableKey={clerkPubKey}
+      proxyUrl={clerkProxyUrl}
+      appearance={clerkAppearance}
+      signInUrl={`${basePath}/sign-in`}
+      signUpUrl={`${basePath}/sign-up`}
+      localization={{
+        signIn: { start: { title: 'Welcome back', subtitle: 'Sign in to access the owner inbox.' } },
+        signUp: { start: { title: 'Create your account', subtitle: 'A little closer to the conversation.' } },
+      }}
+      routerPush={(to) => setLocation(stripBase(to))}
+      routerReplace={(to) => setLocation(stripBase(to), { replace: true })}
+    >
+      <ClerkQueryClientCacheInvalidator />
+      <Router />
+    </ClerkProvider>
+  );
+}
+
+function ClerkQueryClientCacheInvalidator() {
+  const { addListener } = useClerk();
+  const cache = useQueryClient();
+  const previousUserId = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const unsubscribe = addListener(({ user }) => {
+      const userId = user?.id ?? null;
+      if (previousUserId.current !== undefined && previousUserId.current !== userId) cache.clear();
+      previousUserId.current = userId;
+    });
+    return unsubscribe;
+  }, [addListener, cache]);
+  return null;
 }
 
 function RoutedErrorBoundary({ children }: { children: ReactNode }) {
@@ -914,8 +1461,8 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}>
-          <Router />
+        <WouterRouter base={basePath}>
+          <ClerkRoutes />
         </WouterRouter>
         <Toaster />
       </TooltipProvider>

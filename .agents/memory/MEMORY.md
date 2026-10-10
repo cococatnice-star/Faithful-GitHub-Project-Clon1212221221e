@@ -1,1 +1,2 @@
 - [Imported runtime settings](imported-runtime-settings.md) — compare source-code fidelity separately from Replit-managed runtime settings after artifact registration.
+- [Chat owner label](chat-owner-display-name.md) — keep owner replies identified by the exact public display name, not the login identity.
