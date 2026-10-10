@@ -411,7 +411,7 @@ function OwnerInbox({ onClose }: { onClose: () => void }) {
   const sendReply = useSendOwnerChatReply({ request: { credentials: 'include' } });
   const queryClient = useQueryClient();
   const selectedConversation = list.data?.conversations.find((conversation) => conversation.id === selectedId);
-  useChatStream('owner', selectedId ?? undefined, undefined, hasOwnerSession && !list.isError);
+  useChatStream('owner', selectedId ?? undefined, undefined, hasOwnerSession && list.isSuccess);
 
   useEffect(() => {
     if (isLoaded && !isSignedIn) setSelectedId(null);

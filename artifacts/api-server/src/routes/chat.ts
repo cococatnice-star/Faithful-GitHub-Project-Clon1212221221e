@@ -39,7 +39,7 @@ const ownerAccessCache = new Map<string, number>();
 async function ownerAuthFailure(req: Parameters<RequestHandler>[0]): Promise<{
   status: number;
   message: string;
-} | null {
+} | null> {
   const auth = getAuth(req);
   if (!auth.userId) {
     return { status: 401, message: "Sign in to continue." };
