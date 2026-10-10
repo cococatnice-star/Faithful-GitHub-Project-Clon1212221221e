@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
-import { getAuth } from "@clerk/express";
+import { clerkClient, getAuth } from "@clerk/express";
 import {
   CreateChatMessageBody,
   CreateChatMessageResponse,
@@ -33,11 +33,13 @@ import {
 const router: IRouter = Router();
 const OWNER_DISPLAY_NAME = "CocoX Owner";
 const PRIVATE_PREVIEW_LENGTH = 120;
+const OWNER_ACCESS_CACHE_TTL_MS = 30_000;
+const ownerAccessCache = new Map<string, number>();
 
-function ownerAuthFailure(req: Parameters<RequestHandler>[0]): {
+async function ownerAuthFailure(req: Parameters<RequestHandler>[0]): Promise<{
   status: number;
   message: string;
-} | null {
+} | null> {
   const auth = getAuth(req);
   if (!auth.userId) {
     return { status: 401, message: "Sign in to continue." };
@@ -49,18 +51,34 @@ function ownerAuthFailure(req: Parameters<RequestHandler>[0]): {
     return { status: 503, message: "Owner access is not configured." };
   }
 
-  const claims = auth.sessionClaims as Record<string, unknown> | null;
-  const signedInEmail =
-    typeof claims?.email === "string" ? claims.email.trim().toLowerCase() : "";
-  if (!signedInEmail || signedInEmail !== configuredEmail) {
-    return { status: 403, message: "Owner access is required." };
+  const cachedUntil = ownerAccessCache.get(`${auth.userId}:${configuredEmail}`);
+  if (cachedUntil && cachedUntil > Date.now()) return null;
+
+  try {
+    const user = await clerkClient.users.getUser(auth.userId);
+    const hasVerifiedOwnerEmail = user.emailAddresses.some(
+      (address) =>
+        address.verification?.status === "verified" &&
+        address.emailAddress.trim().toLowerCase() === configuredEmail,
+    );
+    if (!hasVerifiedOwnerEmail) {
+      return { status: 403, message: "Owner access is required." };
+    }
+
+    ownerAccessCache.set(
+      `${auth.userId}:${configuredEmail}`,
+      Date.now() + OWNER_ACCESS_CACHE_TTL_MS,
+    );
+  } catch (error) {
+    req.log.error({ err: error }, "Unable to verify owner email with Clerk");
+    return { status: 503, message: "Owner access could not be verified." };
   }
 
   return null;
 }
 
-const requireOwner: RequestHandler = (req, res, next) => {
-  const failure = ownerAuthFailure(req);
+const requireOwner: RequestHandler = async (req, res, next) => {
+  const failure = await ownerAuthFailure(req);
   if (failure) {
     res.status(failure.status).json({ error: failure.message });
     return;
@@ -393,7 +411,7 @@ router.get("/chat/stream", async (req, res): Promise<void> => {
   let verifiedConversationId: string | undefined;
 
   if (scope === "owner") {
-    const failure = ownerAuthFailure(req);
+    const failure = await ownerAuthFailure(req);
     if (failure) {
       res.status(failure.status).json({ error: failure.message });
       return;
